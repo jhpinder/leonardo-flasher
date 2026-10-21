@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arduino Flasher</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    max-width: 640px; margin: 2em auto; padding: 0 1em; line-height: 1.5;
+  }
+  h1 { font-size: 1.4em; }
+  .step {
+    border: 1px solid #8884; border-radius: 10px;
+    padding: 1em 1.2em; margin: 1em 0;
+  }
+  .step h2 { font-size: 1em; margin: 0 0 .4em; }
+  .step p { margin: .3em 0 .8em; color: #888; font-size: .9em; }
+  button {
+    font: inherit; padding: .55em 1.2em; border-radius: 8px;
+    border: 1px solid #06c; background: #06c; color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .4; cursor: default; }
+  button.secondary { background: transparent; color: inherit; border-color: #8886; }
+  #bar {
+    height: 10px; border-radius: 5px; background: #8883;
+    overflow: hidden; margin: .8em 0 0; display: none;
+  }
+  #fill { height: 100%; width: 0; background: #06c; transition: width .15s; }
+  #fwinfo { font-size: .85em; color: #888; }
+  #fwinfo code { font-size: .95em; }
+  #log {
+    background: #0002; border-radius: 8px; padding: .7em 1em;
+    font-family: ui-monospace, Menlo, monospace; font-size: .8em;
+    white-space: pre-wrap; max-height: 220px; overflow-y: auto; margin-top: 1em;
+  }
+  .ok { color: #2a2; font-weight: 600; }
+  .err { color: #c33; font-weight: 600; }
+  label { font-size: .85em; user-select: none; }
+  .row { display: flex; gap: .8em; align-items: center; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<h1>Arduino Flasher</h1>
+<p>
+  Flashes a compiled Arduino sketch (<code>.hex</code>) onto an ATmega32U4
+  board — Leonardo, Micro, Pro Micro, or anything else running the Caterina
+  (AVR109) bootloader — over USB. Works in <b>Chrome or Edge</b>, no
+  software to install.
+</p>
+
+<div class="step">
+  <h2>Firmware</h2>
+  <p id="fwinfo">Pick a <code>.hex</code> file — the compiled sketch to write.
+     (Get it from Arduino IDE → <i>Sketch → Export compiled binary</i>,
+     or a PlatformIO <code>.pio/build/*/firmware.hex</code>.)</p>
+  <div class="row">
+    <label>Select .hex:
+      <input type="file" id="hexfile" accept=".hex">
+    </label>
+  </div>
+</div>
+
+<div class="step">
+  <h2>1. Connect the board and reset into the bootloader</h2>
+  <p>Plug in the board. Click the button and pick its serial port
+     (e.g. &ldquo;Arduino Leonardo&rdquo;). This resets it into upload mode.</p>
+  <div class="row">
+    <button id="reset">Find board &amp; reset</button>
+    <label><input type="checkbox" id="anyport"> show all serial devices</label>
+  </div>
+</div>
+
+<div class="step">
+  <h2>2. Flash</h2>
+  <p>Click within ~8 seconds of the reset, then pick the port that
+     appears (usually the same board name — now in bootloader mode).</p>
+  <div class="row">
+    <button id="flash" disabled>Flash firmware</button>
+    <label><input type="checkbox" id="verify" checked> verify after write</label>
+  </div>
+  <div id="bar"><div id="fill"></div></div>
+</div>
+
+<div id="log"></div>
+
+<p style="font-size:.8em;color:#888;margin-top:1.5em">
+  AVR109 / Caterina bootloader over WebSerial — ATmega32U4 boards only.
+  The board must already have its bootloader flashed (all stock
+  Leonardos/Micros do).
+</p>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const logEl = $('log'), fill = $('fill'), bar = $('bar');
+const log = (m, cls) => {
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.textContent = m;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+};
+
+// ---- state ---------------------------------------------------------------
+let hexText = null;      // Intel HEX source text
+let hexName = '';
+
+if (!('serial' in navigator)) {
+  log('WebSerial is not available in this browser.', 'err');
+  log('Use Chrome or Edge on desktop.');
+  $('reset').disabled = true;
+}
+
+// ---- Intel HEX parsing ----------------------------------------------------
+function parseHex(text) {
+  const mem = new Map();
+  let upper = 0, max = 0;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line[0] !== ':') throw new Error('bad hex line: ' + line.slice(0, 20));
+    const len = parseInt(line.substr(1, 2), 16);
+    const addr = parseInt(line.substr(3, 4), 16);
+    const type = parseInt(line.substr(7, 2), 16);
+    if (type === 0x00) {
+      const base = upper + addr;
+      for (let i = 0; i < len; i++)
+        mem.set(base + i, parseInt(line.substr(9 + 2 * i, 2), 16));
+      max = Math.max(max, base + len);
+    } else if (type === 0x01) {
+      break;
+    } else if (type === 0x04) {
+      upper = parseInt(line.substr(9, 4), 16) << 16;
+    } else if (type === 0x02) {
+      upper = parseInt(line.substr(9, 4), 16) << 4;
+    }
+  }
+  if (!max) throw new Error('hex file has no data');
+  const img = new Uint8Array(max).fill(0xFF);
+  for (const [a, b] of mem) img[a] = b;
+  return img;
+}
+
+// If a firmware.hex sits next to this page it auto-loads — handy when the
+// site is hosted as a distribution point for a specific sketch. Absence is
+// normal; the file picker above is the primary path.
+async function loadDefaultHex() {
+  try {
+    const r = await fetch('firmware.hex', { cache: 'no-store' });
+    if (!r.ok) return;
+    hexText = await r.text();
+    hexName = 'firmware.hex';
+    const img = parseHex(hexText);
+    $('fwinfo').innerHTML =
+      `<code>${hexName}</code> — ${img.length} bytes of flash ` +
+      `(${Math.ceil(img.length / 128)} pages), or pick a different .hex:`;
+  } catch { /* no bundled hex — picker only */ }
+}
+loadDefaultHex();
+
+$('hexfile').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    hexText = await f.text();
+    const img = parseHex(hexText);
+    hexName = f.name;
+    $('fwinfo').innerHTML =
+      `<code>${hexName}</code> — ${img.length} bytes (${Math.ceil(img.length / 128)} pages)`;
+    log(`Loaded ${f.name}`);
+  } catch (err) {
+    log('Could not parse ' + f.name + ': ' + err.message, 'err');
+  }
+});
+
+// ---- serial helpers -------------------------------------------------------
+const KNOWN_PORTS = [
+  { usbVendorId: 0x2341, usbProductId: 0x8036 }, // Leonardo sketch
+  { usbVendorId: 0x2341, usbProductId: 0x0036 }, // Leonardo bootloader
+  { usbVendorId: 0x2341, usbProductId: 0x8037 }, // Micro sketch
+  { usbVendorId: 0x2341, usbProductId: 0x0037 }, // Micro bootloader
+  { usbVendorId: 0x1B4F, usbProductId: 0x9205 }, // Pro Micro 5V boot
+  { usbVendorId: 0x1B4F, usbProductId: 0x9206 }, // Pro Micro 5V sketch
+  { usbVendorId: 0x1B4F, usbProductId: 0x9207 }, // Pro Micro 3V3 boot
+  { usbVendorId: 0x1B4F, usbProductId: 0x9208 }, // Pro Micro 3V3 sketch
+  { usbVendorId: 0x239A, usbProductId: 0x800C }, // Feather 32u4 sketch
+  { usbVendorId: 0x239A, usbProductId: 0x000C }, // Feather 32u4 boot
+];
+
+async function pickPort() {
+  if ($('anyport').checked) return navigator.serial.requestPort();
+  try {
+    return await navigator.serial.requestPort({ filters: KNOWN_PORTS });
+  } catch (e) {
+    // No device shown with our filters — fall back to unfiltered so clones work
+    if (e.name === 'NotFoundError')
+      return navigator.serial.requestPort();
+    throw e;
+  }
+}
+
+// Step 1: open at 1200 baud — the sketch resets into the bootloader the
+// moment the host applies that baud rate. The port object often dies
+// mid-open/close when that happens, so errors here usually mean success.
+$('reset').addEventListener('click', async () => {
+  let port;
+  try {
+    port = await pickPort();
+  } catch (e) {
+    if (e.name !== 'NotFoundError') log('Port pick failed: ' + e.message, 'err');
+    return;
+  }
+  try {
+    await port.open({ baudRate: 1200 });
+  } catch (e) {
+    log('Port reset during open (expected) — board should be in bootloader mode.');
+    $('flash').disabled = false;
+    return;
+  }
+  try {
+    await port.close();
+  } catch {
+    // device dropped while closing — also fine, it already reset
+  }
+  log('Reset signal sent — board is in bootloader mode for ~8 s.');
+  $('flash').disabled = false;
+});
+
+// ---- AVR109 (Caterina) -----------------------------------------------------
+let reader, rxBuf = [], rxWait;
+
+function onData(chunk) {
+  rxBuf.push(...chunk);
+  const w = rxWait;
+  rxWait = null;          // check() re-arms itself if more data is still needed
+  if (w) w();
+}
+function waitBytes(n, ms = 2000) {
+  return new Promise((res, rej) => {
+    const t = setTimeout(() => { rxWait = null; rej(new Error('read timeout')); }, ms);
+    const check = () => {
+      if (rxBuf.length >= n) { clearTimeout(t); res(); }
+      else rxWait = check;
+    };
+    check();
+  });
+}
+
+async function cmd(port, bytes, want = 1, ms = 2000) {
+  const w = port.writable.getWriter();
+  await w.write(new Uint8Array(bytes));
+  w.releaseLock();
+  await waitBytes(want, ms);
+  return rxBuf.splice(0, want);
+}
+
+async function cmdExpect(port, bytes, ms = 2000) {
+  const r = await cmd(port, bytes, 1, ms);
+  return r[0];
+}
+
+async function startReader(port) {
+  rxBuf = [];
+  reader = port.readable.getReader();
+  (async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done || !value) break;
+      onData(value);
+    }
+  })();
+}
+async function stopReader() {
+  try { await reader.cancel(); } catch {}
+  reader.releaseLock();
+  reader = null;
+}
+
+function err(msg) { throw new Error(msg); }
+
+async function flash(port, img, doVerify) {
+  const PAGE = 128;
+  // pad image to a page boundary so every 'B' write is a full page
+  if (img.length % PAGE) {
+    const pad = new Uint8Array(Math.ceil(img.length / PAGE) * PAGE).fill(0xFF);
+    pad.set(img);
+    img = pad;
+  }
+
+  // Caterina eats the first byte written after open — send a sacrificial
+  // '?', give it a moment, then drain whatever came back.
+  {
+    const w = port.writable.getWriter();
+    await w.write(new Uint8Array([0x3F]));
+    w.releaseLock();
+    await new Promise(r => setTimeout(r, 300));
+    rxBuf.length = 0;
+  }
+
+  // 'S' programmer id — retry a few times in case the first real write
+  // also fell on the floor.
+  let id = null;
+  for (let i = 0; i < 3 && !id; i++) {
+    try { id = await cmd(port, [0x53], 7, 800); }
+    catch { rxBuf.length = 0; }
+  }
+  if (!id) err('bootloader did not answer — reset again and retry (step 1)');
+  log('Programmer: ' + String.fromCharCode(...id));
+  await cmd(port, [0x56], 2);                            // 'V' sw version
+  const sig = await cmd(port, [0x73], 3);                // 's' signature
+  const sigHex = sig.map(b => b.toString(16).padStart(2, '0')).join(' ');
+  // Caterina reports the 32u4 signature as "87 95 1e" (LSB first)
+  log('Signature: ' + sigHex +
+      (sig.includes(0x1e) ? ' (ATmega32U4)' : ' (unexpected — flashing anyway)'));
+
+  // chip erase — Caterina may reply '?' and self-erase per page; tolerate either
+  const e = await cmdExpect(port, [0x65]);               // 'e'
+  if (e === 0x3F) log('Note: bootloader has no bulk erase (page erase on write).');
+
+  const setAddr = async byteAddr => {
+    const wordAddr = byteAddr >> 1;                      // AVR109 uses word addr
+    const r = await cmdExpect(port, [0x41, wordAddr >> 8, wordAddr & 0xFF]);
+    if (r !== 0x0D) err(`address command failed (got 0x${(r ?? -1).toString(16)})`);
+  };
+
+  const pages = Math.ceil(img.length / PAGE);
+  for (let p = 0; p < pages; p++) {
+    const byteAddr = p * PAGE;
+    const chunk = img.slice(byteAddr, byteAddr + PAGE);
+    await setAddr(byteAddr);
+    const r = await cmdExpect(port,
+      [0x42, 0, chunk.length, 0x46, ...chunk], 3000);    // 'B' flash
+    if (r !== 0x0D) err(`write failed at page ${p} (got 0x${(r ?? -1).toString(16)})`);
+    fill.style.width = (100 * (p + 1) / pages / (doVerify ? 2 : 1)) + '%';
+  }
+  log(`Wrote ${pages} pages (${img.length} bytes).`);
+
+  if (doVerify) {
+    for (let p = 0; p < pages; p++) {
+      const byteAddr = p * PAGE;
+      const want = Math.min(PAGE, img.length - byteAddr);
+      await setAddr(byteAddr);
+      const got = await cmd(port, [0x67, 0, want, 0x46], want, 3000); // 'g' read
+      for (let i = 0; i < want; i++)
+        if (got[i] !== img[byteAddr + i])
+          err(`verify mismatch at 0x${(byteAddr + i).toString(16)}`);
+      fill.style.width = (50 + 50 * (p + 1) / pages) + '%';
+    }
+    log('Verify OK — every byte matches.', 'ok');
+  }
+
+  // 'E' exit — Caterina may drop the port without ACKing; a timeout here
+  // is not a failure since the write+verify already succeeded.
+  try { await cmdExpect(port, [0x45]); } catch { /* rebooted mid-command */ }
+}
+
+$('flash').addEventListener('click', async () => {
+  if (!hexText) { log('No .hex loaded — pick a firmware file first.', 'err'); return; }
+  let port;
+  try {
+    const img = parseHex(hexText);
+    port = await pickPort();
+    await port.open({ baudRate: 57600 });
+    await startReader(port);
+    bar.style.display = 'block';
+    fill.style.width = '0';
+    log('Flashing ' + hexName + '…');
+    await flash(port, img, $('verify').checked);
+    log('Done — board rebooting into the new firmware.', 'ok');
+    $('flash').disabled = true;
+  } catch (e) {
+    if (e.name === 'NotFoundError') {
+      log('No port picked — the bootloader may have timed out. ' +
+          'Run step 1 again, or hold the board’s reset button and click Flash.',
+          'err');
+    } else {
+      log('Flash failed: ' + e.message, 'err');
+      log('Run step 1 again to re-enter the bootloader.');
+    }
+  } finally {
+    try { if (reader) await stopReader(); } catch {}
+    try { if (port) await port.close(); } catch {}
+  }
+});
+</script>
+</body>
+</html>
